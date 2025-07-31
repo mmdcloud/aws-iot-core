@@ -2,6 +2,26 @@ resource "random_id" "id" {
   byte_length = 8
 }
 
+# Generate private key locally
+resource "tls_private_key" "device_key" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
+# Generate a self-signed certificate locally
+resource "tls_self_signed_cert" "device_cert" {
+  private_key_pem       = tls_private_key.device_key.private_key_pem
+  validity_period_hours = 8760
+  allowed_uses          = ["key_encipherment", "digital_signature", "server_auth"]
+
+  subject {
+    common_name  = "my-iot-device"
+    organization = "MyOrg"
+  }
+}
+
+data "aws_iot_endpoint" "iot" {}
+
 # -----------------------------------------------------------------------------------------
 # VPC Configuration
 # -----------------------------------------------------------------------------------------
@@ -180,10 +200,14 @@ module "iot_instance" {
   instance_type               = "t2.micro"
   key_name                    = "madmaxkeypair"
   associate_public_ip_address = true
-  user_data                   = filebase64("${path.module}/scripts/user_data.sh")
-  instance_profile            = aws_iam_instance_profile.iam_instance_profile.name
-  subnet_id                   = module.public_subnets.subnets[0].id
-  security_groups             = [module.security_group.id]
+  user_data = base64encode(templatefile("${path.module}/scripts/user_data.sh", {
+    ENDPOINT    = "${data.aws_iot_endpoint.iot.endpoint_address}"
+    DEVICE_CERT = "${aws_iot_certificate.cert.certificate_pem}"
+    PRIVATE_KEY = "${tls_private_key.device_key.private_key_pem}"
+  }))
+  instance_profile = aws_iam_instance_profile.iam_instance_profile.name
+  subnet_id        = module.public_subnets.subnets[0].id
+  security_groups  = [module.security_group.id]
 }
 
 # -----------------------------------------------------------------------------------------
@@ -319,7 +343,8 @@ resource "aws_iot_policy" "pubsub" {
 }
 
 resource "aws_iot_certificate" "cert" {
-  active = true
+  certificate_pem = tls_self_signed_cert.device_cert.cert_pem
+  active          = true
 }
 
 resource "aws_iot_thing_principal_attachment" "attach" {
@@ -339,8 +364,8 @@ resource "aws_iam_role" "iot_kinesis_role" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Action    = "sts:AssumeRole",
-      Effect    = "Allow",
+      Action = "sts:AssumeRole",
+      Effect = "Allow",
       Principal = {
         Service = "iot.amazonaws.com"
       }
@@ -355,8 +380,8 @@ resource "aws_iam_policy" "iot_kinesis_policy" {
   policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect   = "Allow",
-      Action   = [
+      Effect = "Allow",
+      Action = [
         "kinesis:PutRecord",
         "kinesis:PutRecords"
       ],
@@ -375,13 +400,13 @@ resource "aws_iot_topic_rule" "kinesis_rule" {
   name        = "iot_to_kinesis_rule"
   description = "Rule to send IoT data to Kinesis Data Stream"
   enabled     = true
-  sql         = "SELECT * FROM 'iot/topic'"
+  sql         = "SELECT * FROM 'topic/mqtt'"
   sql_version = "2016-03-23"
 
   kinesis {
-    stream_name  = "${module.kinesis_stream.name}"
-    partition_key = "${topic()}"
-    role_arn     = aws_iam_role.iot_kinesis_role.arn
+    stream_name   = module.kinesis_stream.name
+    partition_key = "deviceId"
+    role_arn      = aws_iam_role.iot_kinesis_role.arn
   }
 }
 

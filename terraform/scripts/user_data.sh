@@ -1,11 +1,11 @@
 #!/bin/bash
 mkdir -p /etc/aws-iot
 cat <<FILE > /etc/aws-iot/device-cert.pem
-${aws_iot_certificate.device_cert.certificate_pem}
+${DEVICE_CERT}
 FILE
 
 cat <<FILE > /etc/aws-iot/private-key.pem
-${tls_private_key.device_key.private_key_pem}
+${PRIVATE_KEY}
 FILE
 
 # Download Amazon Root CA
@@ -17,3 +17,5 @@ sudo apt-get install -y python3-venv
 sudo apt-get install -y awscli
 sudo apt-get install -y jq
 python3 -m pip install awsiotsdk --break-system-packages
+
+echo "ENDPOINT=${ENDPOINT}" > /home/ubuntu/.env
