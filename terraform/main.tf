@@ -1,3 +1,7 @@
+resource "random_id" "id" {
+  byte_length = 8
+}
+
 # -----------------------------------------------------------------------------------------
 # VPC Configuration
 # -----------------------------------------------------------------------------------------
@@ -207,13 +211,6 @@ module "destination_bucket" {
   bucket_name        = "destination-bucket-${random_id.id.hex}"
   objects            = []
   versioning_enabled = "Enabled"
-  force_destroy = true  
-}
-
-module "s3_firehose_backup_bucket" {
-  source             = "./modules/s3"
-  bucket_name        = "s3-firehose-backup-bucket-${random_id.id.hex}"
-  versioning_enabled = "Enabled"
   force_destroy      = true
 }
 
@@ -227,23 +224,71 @@ module "athena_temp_results_bucket" {
 # -----------------------------------------------------------------------------------------
 # Kinesis Data Firehose
 # -----------------------------------------------------------------------------------------
+resource "aws_iam_role" "firehose_role" {
+  name = "firehose_delivery_role"
 
-module "firehose" {
-  source                     = "./modules/firehose"
-  name                       = "firehose"
-  destination                = "s3"
-  kinesis_stream_arn         = module.kinesis_stream.arn
-  kinesis_stream_role_arn    = module.firehose_iam_role.arn
-  opensearch_domain_arn      = module.opensearch.domain_arn
-  opensearch_role_arn        = module.firehose_iam_role.arn
-  opensearch_index_name      = "iot-index"
-  processing_enabled         = true
-  backup_bucket_arn          = module.s3_firehose_backup_bucket.arn
-  s3_compression_format      = "GZIP"
-  s3_role_arn                = module.firehose_iam_role.arn
-  processing_type            = "Lambda"
-  processing_parameter_name  = "LambdaArn"
-  processing_parameter_value = module.iot_transform_function.arn
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "firehose.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_policy" "firehose_policy" {
+  name = "firehose_policy"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:PutObjectAcl",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "${module.destination_bucket.arn}",
+          "${module.destination_bucket.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kinesis:DescribeStream",
+          "kinesis:GetShardIterator",
+          "kinesis:GetRecords"
+        ]
+        Resource = ["${module.kinesis_stream.arn}"]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "firehose_attach" {
+  role       = aws_iam_role.firehose_role.name
+  policy_arn = aws_iam_policy.firehose_policy.arn
+}
+
+resource "aws_kinesis_firehose_delivery_stream" "firehose_to_s3" {
+  name        = "firehose-stream"
+  destination = "extended_s3"
+
+  kinesis_source_configuration {
+    kinesis_stream_arn = module.kinesis_stream.arn
+    role_arn           = aws_iam_role.firehose_role.arn
+  }
+
+  extended_s3_configuration {
+    role_arn           = aws_iam_role.firehose_role.arn
+    bucket_arn         = module.destination_bucket.arn
+    compression_format = "UNCOMPRESSED"
+  }
 }
 
 # -----------------------------------------------------------------------------------------
@@ -287,9 +332,63 @@ resource "aws_iot_policy_attachment" "policy_attach" {
   target = aws_iot_certificate.cert.arn
 }
 
+# IAM Role that AWS IoT will assume to write to Kinesis
+resource "aws_iam_role" "iot_kinesis_role" {
+  name = "iot_kinesis_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Action    = "sts:AssumeRole",
+      Effect    = "Allow",
+      Principal = {
+        Service = "iot.amazonaws.com"
+      }
+    }]
+  })
+}
+
+# Attach permissions allowing the role to put records to Kinesis
+resource "aws_iam_policy" "iot_kinesis_policy" {
+  name = "iot_kinesis_policy"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect   = "Allow",
+      Action   = [
+        "kinesis:PutRecord",
+        "kinesis:PutRecords"
+      ],
+      Resource = "${module.kinesis_stream.arn}"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "iot_kinesis_attach" {
+  role       = aws_iam_role.iot_kinesis_role.name
+  policy_arn = aws_iam_policy.iot_kinesis_policy.arn
+}
+
+# AWS IoT Topic Rule that sends data from a topic to Kinesis Data Stream
+resource "aws_iot_topic_rule" "kinesis_rule" {
+  name        = "iot_to_kinesis_rule"
+  description = "Rule to send IoT data to Kinesis Data Stream"
+  enabled     = true
+  sql         = "SELECT * FROM 'iot/topic'"
+  sql_version = "2016-03-23"
+
+  kinesis {
+    stream_name  = "${module.kinesis_stream.name}"
+    partition_key = "${topic()}"
+    role_arn     = aws_iam_role.iot_kinesis_role.arn
+  }
+}
+
 # -----------------------------------------------------------------------------------------
 # Glue Configuration
 # -----------------------------------------------------------------------------------------
+
 resource "aws_iam_role" "glue_crawler_role" {
   name = "glue-crawler-role"
 
@@ -335,7 +434,7 @@ resource "aws_iam_role_policy" "s3_access_policy" {
 
 resource "aws_glue_catalog_database" "database" {
   name        = var.glue_database_name
-  description = "Glue database"
+  description = var.glue_database_name
 }
 
 resource "aws_glue_catalog_table" "table" {
@@ -354,14 +453,14 @@ resource "aws_glue_crawler" "crawler" {
 }
 
 resource "aws_athena_workgroup" "workgroup" {
-  name = "workgroup"
-
+  name        = "workgroup"
+  description = "Athena workgroup for querying IoT data"
   configuration {
     enforce_workgroup_configuration    = true
     publish_cloudwatch_metrics_enabled = true
 
     result_configuration {
-      output_location = "s3://${module.athena_temp_results_bucket.bucket}/"        
+      output_location = "s3://${module.athena_temp_results_bucket.bucket}/"
     }
   }
 }
